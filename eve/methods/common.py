@@ -6,7 +6,7 @@
 
     Utility functions for API methods implementations.
 
-    :copyright: (c) 2015 by Nicola Iarocci.
+    :copyright: (c) 2016 by Nicola Iarocci.
     :license: BSD, see LICENSE for more details.
 """
 import time
@@ -62,8 +62,8 @@ def get_document(resource, concurrency_check, **lookup):
         if not req.if_match and config.IF_MATCH and concurrency_check:
             # we don't allow editing unless the client provides an etag
             # for the document
-            abort(403, description='An etag must be provided to edit a '
-                  'document')
+            abort(428, description='To edit a document '
+                  'its etag must be provided using the If-Match header')
 
         # ensure the retrieved document has LAST_UPDATED and DATE_CREATED,
         # eventually with same default values as in GET.
@@ -126,6 +126,10 @@ def payload():
     then returns the request payload as a dict. If request Content-Type is
     unsupported, aborts with a 400 (Bad Request).
 
+    .. versionchanged:: 0.7
+       Allow 'multipart/form-data' form fields to be JSON encoded, once the
+       MULTIPART_FORM_FIELDS_AS_JSON setting was been set.
+
     .. versionchanged:: 0.3
        Allow 'multipart/form-data' content type.
 
@@ -158,10 +162,25 @@ def payload():
             # merge form fields and request files, so we get a single payload
             # to be validated against the resource schema.
 
-            # list() is needed because Python3 items() returns a dict_view, not
-            # a list as in Python2.
-            return dict(list(request.form.to_dict().items()) +
-                        list(request.files.to_dict().items()))
+            if config.MULTIPART_FORM_FIELDS_AS_JSON:
+
+                formItems = dict(list(request.form.to_dict().items()))
+
+                for key in formItems.keys():
+                    try:
+                        formItems[key] = json.loads(formItems[key])
+                    except ValueError:
+                        formItems[key] = json.loads(
+                            '"{0}"'.format(formItems[key]))
+
+                return dict(list(formItems.items()) +
+                            list(request.files.to_dict().items()))
+            else:
+                # list() is needed because Python3 items() returns a
+                # dict_view, not a list as in Python2.
+                return dict(list(request.form.to_dict().items()) +
+                            list(request.files.to_dict().items()))
+
         else:
             abort(400, description='No multipart/form-data supplied')
     else:
@@ -369,15 +388,14 @@ def serialize(document, resource=None, schema=None, fields=None):
                                     serialize(sublist[i],
                                               schema=sublist_schema['schema'])
                                 elif item_type in app.data.serializers:
-                                        sublist[i] = \
-                                            app.data.serializers[item_type](v)
+                                    sublist[i] = serialize_value(item_type, v)
                     else:
                         # a list of one type, arbitrary length
                         field_type = field_schema.get('type')
                         if field_type in app.data.serializers:
                             for i, v in enumerate(document[field]):
                                 document[field][i] = \
-                                    app.data.serializers[field_type](v)
+                                    serialize_value(field_type, v)
                 elif 'items' in field_schema:
                     # a list of multiple types, fixed length
                     for i, (s, v) in enumerate(zip(field_schema['items'],
@@ -385,8 +403,7 @@ def serialize(document, resource=None, schema=None, fields=None):
                         field_type = s.get('type')
                         if field_type in app.data.serializers:
                             document[field][i] = \
-                                app.data.serializers[field_type](
-                                    document[field][i])
+                                serialize_value(field_type, document[field][i])
                 elif 'valueschema' in field_schema:
                     # a valueschema
                     field_type = field_schema['valueschema']['type']
@@ -394,18 +411,25 @@ def serialize(document, resource=None, schema=None, fields=None):
                         target = document[field]
                         for field in target:
                             target[field] = \
-                                app.data.serializers[field_type](target[field])
+                                serialize_value(field_type, target[field])
                 elif field_type in app.data.serializers:
                     # a simple field
-                    try:
-                        document[field] = \
-                            app.data.serializers[field_type](document[field])
-                    except (ValueError, TypeError, InvalidId):
-                        # value can't be casted, we continue processing the
-                        # rest of the document. Validation will later report
-                        # back the issue.
-                        pass
+                    document[field] = \
+                        serialize_value(field_type, document[field])
+
     return document
+
+
+def serialize_value(field_type, value):
+    """Serialize value of a given type. Relies on the app.data.serializers
+    dictionary.
+    """
+    try:
+        return app.data.serializers[field_type](value)
+    except (KeyError, ValueError, TypeError, InvalidId):
+        # value can't be cast or no serializer defined, return as is and
+        # validation will later report back the issue.
+        return value
 
 
 def normalize_dotted_fields(document):

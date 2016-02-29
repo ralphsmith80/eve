@@ -6,7 +6,7 @@
     This module implements the central WSGI application object as a Flask
     subclass.
 
-    :copyright: (c) 2015 by Nicola Iarocci.
+    :copyright: (c) 2016 by Nicola Iarocci.
     :license: BSD, see LICENSE for more details.
 """
 import os
@@ -363,6 +363,9 @@ class Eve(Flask, Events):
         :param resource: resource name.
         :param schema: schema definition for the resource.
 
+        .. versionchanged:: 0.6.2
+           Do not allow '$' and '.' in root and dict field names. #780.
+
         .. versionchanged:: 0.6
            ID_FIELD in the schema is not an offender anymore.
 
@@ -388,13 +391,14 @@ class Eve(Flask, Events):
            Now collecting offending items in a list and inserting results into
            the exception message.
         """
-        resource_settings = self.config['DOMAIN'][resource]
+        def validate_field_name(field):
+            forbidden = ['$', '.']
+            if any(x in field for x in forbidden):
+                raise SchemaException(
+                    "Field '%s' cannot contain any of the following: '%s'." %
+                    (field, ', '.join(forbidden)))
 
-        # ensure id_field is defined as unique
-        id_field = resource_settings['id_field']
-        if 'unique' not in schema[id_field] or not schema[id_field]['unique']:
-            raise SchemaException("'unique' key is mandatory for id field "
-                                  "'%s'" % id_field)
+        resource_settings = self.config['DOMAIN'][resource]
 
         # ensure automatically handled fields aren't defined
         fields = [eve.DATE_CREATED, eve.LAST_UPDATED, eve.ETAG]
@@ -417,8 +421,13 @@ class Eve(Flask, Events):
                                   '(they will be handled automatically).'
                                   % (', '.join(offenders), resource))
 
-        # check data_relation rules
         for field, ruleset in schema.items():
+            validate_field_name(field)
+            if 'dict' in ruleset.get('type', ''):
+                for field in ruleset.get('schema', {}).keys():
+                    validate_field_name(field)
+
+            # check data_relation rules
             if 'data_relation' in ruleset:
                 if 'resource' not in ruleset['data_relation']:
                     raise SchemaException("'resource' key is mandatory for "
@@ -501,6 +510,10 @@ class Eve(Flask, Events):
     def _set_resource_defaults(self, resource, settings):
         """ Low-level method which sets default values for one resource.
 
+        .. versionchanged:: 0.6.2
+           Fix: startup crash when both SOFT_DELETE and ALLOW_UNKNOWN are True.
+
+           (#722).
         .. versionchanged:: 0.6.1
            Fix: inclusive projection defined for a datasource is ignored
            (#722).
@@ -587,13 +600,52 @@ class Eve(Flask, Events):
         schema = settings.setdefault('schema', {})
         self.set_schema_defaults(schema, settings['id_field'])
 
-        datasource = {}
-        settings.setdefault('datasource', datasource)
+        # 'defaults' helper set contains the names of fields with default
+        # values in their schema definition.
+
+        # TODO support default values for embedded documents.
+        settings['defaults'] = build_defaults(schema)
+
+        # list of all media fields for the resource
+        settings['_media'] = [field for field, definition in schema.items() if
+                              definition.get('type') == 'media']
+
+        if settings['_media'] and not self.media:
+            raise ConfigException('A media storage class of type '
+                                  ' eve.io.media.MediaStorage but be defined '
+                                  'for "media" fields to be properly stored.')
+
+        self._set_resource_datasource(resource, schema, settings)
+
+    def _set_resource_datasource(self, resource, schema, settings):
+        """ Set the default values for the resource 'datasource' setting.
+
+        .. versionadded:: 0.7
+        """
+
+        settings.setdefault('datasource', {})
 
         ds = settings['datasource']
         ds.setdefault('source', resource)
         ds.setdefault('filter', None)
         ds.setdefault('default_sort', None)
+
+        self._set_resource_projection(ds, schema, settings)
+
+        aggregation = ds.setdefault('aggregation', None)
+        if aggregation:
+            aggregation.setdefault('options', {})
+
+            # endpoints serving aggregation queries are read-only and do not
+            # support item lookup.
+            settings['resource_methods'] = ['GET']
+            settings['item_lookup'] = False
+
+    def _set_resource_projection(self, ds, schema, settings):
+        """ Set datasource projection for a resource
+
+        .. versionadded:: 0.7
+        """
 
         projection = ds.get('projection', {})
 
@@ -604,7 +656,7 @@ class Eve(Flask, Events):
         # with automatic fields. Using both inclusion and exclusion will
         # be rejected by Mongo
         if not exclusion and len(schema) and \
-           settings['allow_unknown'] is False:
+                settings['allow_unknown'] is False:
             # enable retrieval of actual schema fields only. Eventual db
             # fields not included in the schema won't be returned.
             # despite projection, automatic fields are always included.
@@ -623,7 +675,8 @@ class Eve(Flask, Events):
             projection = None
         ds.setdefault('projection', projection)
 
-        if settings['soft_delete'] is True and not exclusion:
+        if settings['soft_delete'] is True and not exclusion and \
+                ds['projection'] is not None:
             ds['projection'][self.config['DELETED']] = 1
 
         # 'defaults' helper set contains the names of fields with default
@@ -638,7 +691,7 @@ class Eve(Flask, Events):
 
         if settings['_media'] and not self.media:
             raise ConfigException('A media storage class of type '
-                                  ' eve.io.media.MediaStorage but be defined '
+                                  ' eve.io.media.MediaStorage must be defined '
                                   'for "media" fields to be properly stored.')
 
     def set_schema_defaults(self, schema, id_field):
@@ -659,14 +712,11 @@ class Eve(Flask, Events):
         .. versionadded: 0.0.5
         """
 
-        # id_field has to be 'unique'. Some data layers, e.g. the default mongo
-        # layer ignore this validation rule to avoid a performance hit (with
-        # 'unique' rule set, we would end up with an extra db loopback on every
-        # insert).
-        schema.setdefault(id_field, {
-            'type': 'objectid',
-            'unique': True
-        })
+        # Don't set id_field 'unique' since we already handle
+        # DuplicateKeyConflict in the mongo layer. This also
+        # avoids a performance hit (with 'unique' rule set, we would
+        # end up with an extra db loopback on every insert).
+        schema.setdefault(id_field, {'type': 'objectid'})
 
         # set default 'field' value for all 'data_relation' rulesets, however
         # nested
@@ -914,11 +964,11 @@ class Eve(Flask, Events):
             # add schema collections url
             self.add_url_rule(schema_url, 'schema_collection',
                               view_func=schema_collection_endpoint,
-                              methods=['GET'])
+                              methods=['GET', 'OPTIONS'])
             # add schema item url
             self.add_url_rule(schema_url + '/<resource>', 'schema_item',
                               view_func=schema_item_endpoint,
-                              methods=['GET'])
+                              methods=['GET', 'OPTIONS'])
 
     def __call__(self, environ, start_response):
         """ If HTTP_X_METHOD_OVERRIDE is included with the request and method

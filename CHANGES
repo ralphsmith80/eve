@@ -6,18 +6,71 @@ Here you can see the full list of changes between each Eve release.
 In Development
 --------------
 
-Version 0.6.2
-~~~~~~~~~~~~~
+Version 0.7
+~~~~~~~~~~~
+
+- New: ``MULTIPART_FORM_FIELDS_AS_JSON``. In case you are submitting your
+  resource as ``multipart/form-data`` all form data fields will be submitted as
+  strings, breaking any validation rules you might have on the resource fields.
+  If you want to treat all submitted form data as JSON strings you will have to
+  activate this setting. Closes #806 (Stratos Gerakakis).
+
+- New: Support for MongoDB Aggregation Framework. Endpoints can respond with
+  aggregation results. Clients can optionally influence aggregation
+  results by using the new ``aggregate`` option: ``aggregate={"$year": 2015}``.
+
+- New: Flask views (``@app.route``) can now set ``mongo_prefix`` via Flask's
+  ``g`` object: ``g.mongo_prefix = 'MONGO2'`` (Gustavo Vargas).
 
 - New: Query parameters not recognised by Eve are now returned in HATEOAS URLs
   (Mugur Rus).
+
 - New: ``OPLOG_CHANGE_METHODS`` is a list of HTTP methods which operations will
   include changes into the OpLog (mmizotin).
 
-- Fix: Serialize inside *of and *of_type rules new in Cerberus 0.9. Closes #692
-  (Arnau Orriols).
-- Fix: In ``patch_internal`` Validator is not se twhen ``skip_validation`` is
+- Change: Return ``428 Precondition Required`` instead of a generic ``403
+  Forbidden`` when the ``If-Match`` request header is missing (Arnau Orriols).
+
+- Change: ETag response header now conforms to RFC 7232/2.3 and is surrounded
+  by double quotes. Closes #794.
+
+- Fix: ETag request headers which conform to RFC 7232/2.3 (double quoted value)
+  are now properly processed. Addresses #794.
+
+
+
+Version 0.6.2
+~~~~~~~~~~~~~
+
+- Fix: Mongo does not allow ``$`` and ``.`` in field names. Apply this
+  validation in schemas and dict fields. Closes #780.
+- Fix: Remove "ensure uniqueness of (custom) id fields" feature. Addresses
+  #788.
+- Fix: ``409 Conflict`` not reported since upgrading to PyMongo 3. Closes #680.
+- Fix: when a document is soft deleted, the OPLOG `_updated` field is not the
+  time of the deletion but the time of the previous last update (Cyril
+  Bonnard).
+- Fix: TokenAuth. When the tokens are passed as "Authorization: " or
+  "Authorization: Token " headers, werkzeug does not recognize them as valid
+  authorization header, therefore the ``request.authorization`` field is empty
+  (Luca Di Gaspero).
+- Fix: ``SCHEMA_ENDPOINT`` does not work when schema has lambda function as
+  ``coerce`` rule. Closes #790.
+- Fix: CORS pre-flight requests malfunction on ``SCHEMA_ENDPOINT`` endpoint
+  (Valerie Coffman).
+- Fix: do not attempt to parse ``number`` values as strings when they are
+  numerical (Nick Park).
+- Fix: the ``__init__.py`` ``ITEM_URL`` does not match default_settings.py.
+  Closes #786 (Ralph Smith).
+- Fix: startup crash when both ``SOFT_DELETE`` and ``ALLOW_UNKNOWN`` are
+  enabled. Closes #800.
+- Fix: Serialize inside ``of`` and ``of_type`` rules new in Cerberus 0.9.
+  Closes #692 (Arnau Orriols).
+- Fix: In ``put_internal`` Validator is not set when ``skip_validation`` is
+  ``true`` (Wei Guan).
+- Fix: In ``patch_internal`` Validator is not set when ``skip_validation`` is
   ``true`` (Stratos Gerakakis).
+- Fix: Add missing serializer for fields of type ``number`` (Arnau Orriols).
 - Fix: Skip any null value from serialization (Arnau Orriols).
 - Fix: When ``SOFT_DELETE`` is active an exclusive ``datasource.projection``
   causes a ``500`` error. Closes #752.
@@ -25,7 +78,8 @@ Version 0.6.2
 - Update: PyMongo 3.1 is now required.
 - Update: Flask-PyMongo 0.4+ is now required.
 
-- Docs: fix some typos (Manquer).
+- Docs: fix some typos (Manquer, Patrick Decat).
+- Update license to 2016 (Prayag Verma)
 
 
 Stable

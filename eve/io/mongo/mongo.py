@@ -6,7 +6,7 @@
 
     The actual implementation of the MongoDB data layer.
 
-    :copyright: (c) 2015 by Nicola Iarocci.
+    :copyright: (c) 2016 by Nicola Iarocci.
     :license: BSD, see LICENSE for more details.
 """
 import itertools
@@ -17,7 +17,7 @@ import pymongo
 import simplejson as json
 from bson import ObjectId
 from copy import copy
-from flask import abort, request
+from flask import abort, request, g
 from flask.ext.pymongo import PyMongo
 from pymongo import WriteConcern
 from werkzeug.exceptions import HTTPException
@@ -33,15 +33,23 @@ class MongoJSONEncoder(BaseJSONEncoder):
     """ Proprietary JSONEconder subclass used by the json render function.
     This is needed to address the encoding of special values.
 
+    .. versionchanged:: 0.6.2
+       Do not attempt to serialize callables. Closes #790.
+
     .. versionadded:: 0.2
     """
     def default(self, obj):
         if isinstance(obj, ObjectId):
             # BSON/Mongo ObjectId is rendered as a string
             return str(obj)
-        else:
-            # delegate rendering to base class method
-            return super(MongoJSONEncoder, self).default(obj)
+        if callable(obj):
+            # when SCHEMA_ENDPOINT is active, 'coerce' rule is likely to
+            # contain a lambda/callable which can't be jSON serialized
+            # (and we probably don't want it to be exposed anyway). See #790.
+            return "<callable>"
+
+        # delegate rendering to base class method
+        return super(MongoJSONEncoder, self).default(obj)
 
 
 class Mongo(DataLayer):
@@ -365,6 +373,17 @@ class Mongo(DataLayer):
         )
         return documents
 
+    def aggregate(self, resource, pipeline, options):
+        """
+        .. versionadded:: 0.7
+        """
+        datasource, _, _, _ = self.datasource(resource)
+
+        return self.pymongo(resource).db[datasource].aggregate(
+            pipeline,
+            **options
+        )
+
     def insert(self, resource, doc_or_docs):
         """ Inserts a document into a resource collection.
 
@@ -396,23 +415,29 @@ class Mongo(DataLayer):
             doc_or_docs = [doc_or_docs]
 
         try:
-            return coll.insert_many(doc_or_docs).inserted_ids
-        except pymongo.errors.DuplicateKeyError as e:
-            abort(409, description=debug_error_message(
-                'pymongo.errors.DuplicateKeyError: %s' % e
-            ))
-        except pymongo.errors.InvalidOperation as e:
+            return coll.insert_many(doc_or_docs, ordered=True).inserted_ids
+        except pymongo.errors.BulkWriteError as e:
             self.app.logger.exception(e)
+
+            # since this is an ordered bulk operation, all remaining inserts
+            # are aborted. Be aware that if BULK_ENABLED is True and more than
+            # one document is included with the payload, some documents might
+            # have been successfully inserted, even if the operation was
+            # aborted.
+
+            # report a duplicate key error since this can probably be
+            # handled by the client.
+            for error in e.details['writeErrors']:
+                # amazingly enough, pymongo does not appear to be exposing
+                # error codes as constants.
+                if error['code'] == 11000:
+                    abort(409, description=debug_error_message(
+                        'Duplicate key error at index: %s, message: %s' % (
+                            error['index'], error['errmsg'])
+                    ))
+
             abort(500, description=debug_error_message(
-                'pymongo.errors.InvalidOperation: %s' % e
-            ))
-        except pymongo.errors.OperationFailure as e:
-            # most likely a 'w' (write_concern) setting which needs an
-            # existing ReplicaSet which doesn't exist. Please note that the
-            # update will actually succeed (a new ETag will be needed).
-            self.app.logger.exception(e)
-            abort(500, description=debug_error_message(
-                'pymongo.errors.OperationFailure: %s' % e
+                'pymongo.errors.BulkWriteError: %s' % e
             ))
 
     def _change_request(self, resource, id_, changes, original, replace=False):
@@ -795,7 +820,17 @@ class Mongo(DataLayer):
         This allows Auth classes (for instance) to override default settings to
         use a user-reserved db instance.
 
+        Even a standard Flask view can set the mongo_prefix:
+
+            from flask import g
+
+            g.mongo_prefix = 'MONGO2'
+
         :param resource: endpoint for which a mongo prefix is needed.
+
+        ..versionchanged:: 0.7
+          Allow standard Flask views (@app.route) to set the mongo_prefix on
+          their own.
 
         ..versionadded:: 0.6
         """
@@ -815,11 +850,16 @@ class Mongo(DataLayer):
             pass
 
         px = auth.get_mongo_prefix() if auth else None
+
+        if px is None:
+            px = g.get('mongo_prefix', None)
+
         if px is None:
             if resource:
                 px = config.DOMAIN[resource].get('mongo_prefix', 'MONGO')
             else:
                 px = 'MONGO'
+
         return px
 
     def pymongo(self, resource=None, prefix=None):
